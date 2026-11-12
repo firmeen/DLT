@@ -1,0 +1,4 @@
+requests>=2.31
+beautifulsoup4>=4.12
+truststore>=0.9
+textual>=0.80
