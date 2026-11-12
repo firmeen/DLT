@@ -1,45 +1,89 @@
 
 @echo off
-setlocal
+setlocal EnableExtensions
+
+REM START_DLT.bat
+REM Place this file in the same folder as dlt_collector.py
+
+cd /d "%~dp0" || exit /b 1
 title DLT Statistics Collector
 
-REM Save as START_DLT.bat in the same folder as dlt_collector.py
-
-set "PROJECT_DIR=%~dp0"
-set "SCRIPT=%PROJECT_DIR%dlt_collector.py"
-
+REM --------------------------------------------------
 REM Check application
-if not exist "%SCRIPT%" (
+REM --------------------------------------------------
+
+if not exist "dlt_collector.py" (
     echo [ERROR] dlt_collector.py not found.
-    echo Place START_DLT.bat in the DLT project folder.
     pause
     exit /b 1
 )
 
-REM Detect Python
-set "PYTHON=python"
+REM --------------------------------------------------
+REM Open Windows Terminal in fullscreen
+REM --------------------------------------------------
 
-if exist "%PROJECT_DIR%..\portable\python\python.exe" (
-    set "PYTHON=%PROJECT_DIR%..\portable\python\python.exe"
-) else (
-    where python >nul 2>&1
-    if errorlevel 1 (
-        echo [ERROR] Python not found.
-        pause
-        exit /b 1
+if /I not "%~1"=="--inside" (
+    where wt.exe >nul 2>&1
+    if not errorlevel 1 (
+        wt.exe -w new --fullscreen -d "%CD%" cmd.exe /c "call ""%~f0"" --inside"
+        if not errorlevel 1 exit /b 0
     )
 )
 
-REM Launch Windows Terminal in true fullscreen mode
-where wt.exe >nul 2>&1
+REM --------------------------------------------------
+REM Find Python automatically
+REM --------------------------------------------------
 
-if not errorlevel 1 (
-    wt.exe --window new --fullscreen new-tab --title "DLT Statistics Collector" --startingDirectory "%PROJECT_DIR%" "%PYTHON%" "%SCRIPT%"
-    exit /b 0
+if exist ".venv\Scripts\python.exe" (
+    set "PYTHON=%CD%\.venv\Scripts\python.exe"
+    goto :RUN
 )
 
-REM Fallback: Maximized PowerShell/Command Prompt window
-cd /d "%PROJECT_DIR%"
-start "DLT Statistics Collector" /MAX cmd.exe /k ""%PYTHON%" "%SCRIPT%""
+if exist "venv\Scripts\python.exe" (
+    set "PYTHON=%CD%\venv\Scripts\python.exe"
+    goto :RUN
+)
 
-exit /b 0
+if exist "python.exe" (
+    set "PYTHON=%CD%\python.exe"
+    goto :RUN
+)
+
+where py.exe >nul 2>&1
+if not errorlevel 1 (
+    py -3 --version >nul 2>&1
+    if not errorlevel 1 (
+        set "PYTHON=py -3"
+        goto :RUN
+    )
+)
+
+where python.exe >nul 2>&1
+if not errorlevel 1 (
+    python --version >nul 2>&1
+    if not errorlevel 1 (
+        set "PYTHON=python"
+        goto :RUN
+    )
+)
+
+echo [ERROR] Python 3 not found.
+echo Install Python 3 or create a .venv in this folder.
+pause
+exit /b 1
+
+REM --------------------------------------------------
+REM Run application
+REM --------------------------------------------------
+
+:RUN
+%PYTHON% "dlt_collector.py"
+
+if errorlevel 1 (
+    echo.
+    echo [ERROR] DLT Statistics Collector exited with an error.
+    pause
+)
+
+endlocal
+exit /b

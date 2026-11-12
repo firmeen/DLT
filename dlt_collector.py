@@ -4,7 +4,7 @@
 
 """
 DLT STATISTICS COLLECTOR
-Professional Terminal Interface
+Professional Terminal UI
 
 INSTALL:
     python -m pip install -U textual rich requests beautifulsoup4 truststore
@@ -14,8 +14,8 @@ RUN:
 
 SHORTCUTS:
     Ctrl+R  Refresh catalog
-    Ctrl+D  Download visible files
-    Ctrl+S  Stop operation
+    Ctrl+D  Download all visible files
+    Ctrl+S  Stop
     Ctrl+Q  Quit
 """
 
@@ -72,9 +72,7 @@ from textual.widgets import (
 
 BASE_URL = "https://web.dlt.go.th/statistics/"
 
-DOWNLOAD_URL = (
-    BASE_URL + "load_file_select_new_car.php"
-)
+DOWNLOAD_URL = BASE_URL + "load_file_select_new_car.php"
 
 CATEGORIES = {
     "1.1": {
@@ -134,7 +132,7 @@ DEFAULT_DELAY = 0.8
 
 
 # ============================================================
-# MODELS
+# DATA MODEL
 # ============================================================
 
 @dataclass(frozen=True)
@@ -167,7 +165,7 @@ class DownloadInterrupted(Exception):
 
 
 # ============================================================
-# HELPERS
+# UTILITIES
 # ============================================================
 
 def safe_filename(
@@ -186,18 +184,12 @@ def safe_filename(
         value,
     ).rstrip(" .")
 
-    return (
-        value[:max_length].rstrip(" .")
-        or "unknown"
-    )
+    return value[:max_length].rstrip(" .") or "unknown"
 
 
 def timestamp() -> str:
-
-    return (
-        datetime.now()
-        .astimezone()
-        .isoformat(timespec="seconds")
+    return datetime.now().astimezone().isoformat(
+        timespec="seconds"
     )
 
 
@@ -206,7 +198,6 @@ def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
 
     with path.open("rb") as file:
-
         for chunk in iter(
             lambda: file.read(1024 * 1024),
             b"",
@@ -227,15 +218,10 @@ def extract_filename(
     )
 
     if match:
-
         value = unquote(
             match.group(1).strip().strip('"')
         )
-
-        return re.split(
-            r"[/\\]",
-            value,
-        )[-1]
+        return re.split(r"[/\\]", value)[-1]
 
     match = re.search(
         r'filename\s*=\s*(?:"([^"]+)"|([^;]+))',
@@ -244,16 +230,12 @@ def extract_filename(
     )
 
     if match:
-
         value = (
             match.group(1)
             or match.group(2)
         ).strip()
 
-        return re.split(
-            r"[/\\]",
-            value,
-        )[-1]
+        return re.split(r"[/\\]", value)[-1]
 
     return None
 
@@ -284,12 +266,9 @@ def detect_excel(
             return None
 
         try:
-
             with zipfile.ZipFile(path) as archive:
 
-                names = set(
-                    archive.namelist()
-                )
+                names = set(archive.namelist())
 
                 if "xl/workbook.bin" in names:
                     return ".xlsb"
@@ -299,7 +278,6 @@ def detect_excel(
                     types = ""
 
                     if "[Content_Types].xml" in names:
-
                         types = archive.read(
                             "[Content_Types].xml"
                         ).decode(
@@ -327,12 +305,12 @@ def detect_excel(
     if (
         original.endswith(".xls")
         and "excel" in content_type.lower()
-    ):
-        if (
+        and (
             b"<html" in signature.lower()
             or b"<table" in signature.lower()
-        ):
-            return ".xls"
+        )
+    ):
+        return ".xls"
 
     return None
 
@@ -359,7 +337,7 @@ def google_sheets_export(
 
 
 # ============================================================
-# HTTP CLIENT
+# HTTP SESSION
 # ============================================================
 
 def create_session(
@@ -404,20 +382,12 @@ def create_session(
         max_retries=retry
     )
 
-    session.mount(
-        "https://",
-        adapter,
-    )
-
-    session.mount(
-        "http://",
-        adapter,
-    )
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
 
     session.verify = not insecure
 
     if insecure:
-
         import urllib3
 
         urllib3.disable_warnings(
@@ -439,7 +409,6 @@ def parse_rows(
 ) -> list[DownloadJob]:
 
     config = CATEGORIES[category]
-
     jobs = []
 
     for row_number, row in enumerate(
@@ -459,13 +428,8 @@ def parse_rows(
             strip=True,
         ).lstrip("- ").strip()
 
-        dropdown = row.select_one(
-            "select"
-        )
-
-        button = row.select_one(
-            "button[value]"
-        )
+        dropdown = row.select_one("select")
+        button = row.select_one("button[value]")
 
         if dropdown is None and button is None:
             continue
@@ -477,10 +441,7 @@ def parse_rows(
 
             directory = (
                 Path(config["directory"])
-                / (
-                    f"{row_number:02d}_"
-                    f"{safe_filename(label)}"
-                )
+                / f"{row_number:02d}_{safe_filename(label)}"
             )
 
         else:
@@ -490,21 +451,13 @@ def parse_rows(
 
             directory = (
                 Path(config["directory"])
-                / (
-                    f"{topic_number:02d}_"
-                    f"{safe_filename(topic)}"
-                )
-                / (
-                    f"{row_number:02d}_"
-                    f"{safe_filename(label)}"
-                )
+                / f"{topic_number:02d}_{safe_filename(topic)}"
+                / f"{row_number:02d}_{safe_filename(label)}"
             )
 
         if dropdown is not None:
 
-            for option in dropdown.find_all(
-                "option"
-            ):
+            for option in dropdown.find_all("option"):
 
                 file_id = str(
                     option.get("value", "")
@@ -527,8 +480,7 @@ def parse_rows(
                         file_id=file_id,
                         type_id=config["type_id"],
                         directory=(
-                            directory
-                            / safe_filename(period)
+                            directory / safe_filename(period)
                         ),
                     )
                 )
@@ -550,10 +502,7 @@ def parse_rows(
                     period="Direct download",
                     file_id=file_id,
                     type_id=config["type_id"],
-                    directory=(
-                        directory
-                        / "Direct_Download"
-                    ),
+                    directory=directory / "Direct_Download",
                 )
             )
 
@@ -575,7 +524,6 @@ def parse_catalog(
     )
 
     if not accordions:
-
         return parse_rows(
             soup.select("div.row.border"),
             category,
@@ -597,9 +545,7 @@ def parse_catalog(
 
         jobs.extend(
             parse_rows(
-                rows=card.select(
-                    "div.row.border"
-                ),
+                rows=card.select("div.row.border"),
                 category=category,
                 topic=heading.get_text(
                     " ",
@@ -617,9 +563,7 @@ def fetch_category(
     category: str,
 ) -> list[DownloadJob]:
 
-    endpoint = CATEGORIES[category][
-        "endpoint"
-    ]
+    endpoint = CATEGORIES[category]["endpoint"]
 
     response = session.get(
         BASE_URL + endpoint,
@@ -713,11 +657,7 @@ def stream_download(
                 if chunk:
                     file.write(chunk)
 
-    return (
-        final_url,
-        content_type,
-        disposition,
-    )
+    return final_url, content_type, disposition
 
 
 def download_file(
@@ -779,8 +719,7 @@ def download_file(
         return result
 
     temporary = (
-        directory
-        / f"DLT_{job.file_id}.part"
+        directory / f"DLT_{job.file_id}.part"
     )
 
     try:
@@ -848,9 +787,7 @@ def download_file(
 
         if extension is None:
 
-            debug_directory = (
-                root / "_debug"
-            )
+            debug_directory = root / "_debug"
 
             debug_directory.mkdir(
                 parents=True,
@@ -933,13 +870,11 @@ def download_file(
 
     finally:
 
-        temporary.unlink(
-            missing_ok=True
-        )
+        temporary.unlink(missing_ok=True)
 
 
 # ============================================================
-# TERMINAL UI
+# TERMINAL APPLICATION
 # ============================================================
 
 class DLTApp(App):
@@ -968,9 +903,7 @@ class DLTApp(App):
         padding: 0 2 1 2;
     }
 
-    /* ------------------------------------ */
-    /* Brand */
-    /* ------------------------------------ */
+    /* BRAND */
 
     #brand {
         height: 3;
@@ -983,9 +916,7 @@ class DLTApp(App):
         text-style: bold;
     }
 
-    /* ------------------------------------ */
-    /* Source / destination */
-    /* ------------------------------------ */
+    /* CONFIGURATION */
 
     #configuration {
         height: 5;
@@ -993,7 +924,7 @@ class DLTApp(App):
     }
 
     #category_group {
-        width: 38;
+        width: 39;
         height: 5;
         margin-right: 2;
     }
@@ -1010,19 +941,60 @@ class DLTApp(App):
         padding-left: 1;
     }
 
-    #category {
-        width: 100%;
-        height: 3;
-    }
-
     #output {
         width: 100%;
         height: 3;
     }
 
-    /* ------------------------------------ */
-    /* Action bar */
-    /* ------------------------------------ */
+    /* CATEGORY SELECT: SINGLE BORDER, VISIBLE LABEL */
+
+    #category {
+        width: 100%;
+        height: 3;
+        min-height: 3;
+        max-height: 3;
+        border: tall #304352;
+        padding: 0;
+        background: #16232e;
+        color: #ffffff;
+    }
+
+    #category:focus {
+        border: tall #ac9b79;
+    }
+
+    #category > SelectCurrent {
+        width: 100%;
+        height: 1;
+        min-height: 1;
+        max-height: 1;
+        border: none !important;
+        padding: 0 1;
+        background: #16232e;
+        color: #ffffff;
+    }
+
+    #category > SelectCurrent > #label {
+        width: 1fr;
+        height: 1;
+        color: #ffffff;
+        background: transparent;
+        text-style: bold;
+    }
+
+    #category > SelectCurrent > .arrow {
+        color: #dce5e9;
+        background: transparent;
+    }
+
+    #category > SelectOverlay {
+        background: #172631;
+        color: #ffffff;
+        border: tall #405666;
+        max-height: 12;
+    }
+
+    /* ACTION BUTTONS */
 
     #actions {
         height: 3;
@@ -1041,26 +1013,31 @@ class DLTApp(App):
     #refresh {
         width: 19;
         min-width: 19;
+        background: #30485a;
     }
 
     #download_all {
         width: 22;
         min-width: 22;
+        background: #23685f;
     }
 
     #download_selected {
         width: 23;
         min-width: 23;
+        background: #285361;
     }
 
     #stop {
         width: 12;
         min-width: 12;
+        background: #61383b;
     }
 
     #settings_button {
         width: 15;
         min-width: 15;
+        background: #263846;
     }
 
     Button {
@@ -1081,29 +1058,7 @@ class DLTApp(App):
         opacity: 0.45;
     }
 
-    #refresh {
-        background: #30485a;
-    }
-
-    #download_all {
-        background: #23685f;
-    }
-
-    #download_selected {
-        background: #285361;
-    }
-
-    #stop {
-        background: #61383b;
-    }
-
-    #settings_button {
-        background: #263846;
-    }
-
-    /* ------------------------------------ */
-    /* Optional settings — hidden initially */
-    /* ------------------------------------ */
+    /* ADVANCED OPTIONS */
 
     #advanced {
         display: none;
@@ -1152,9 +1107,23 @@ class DLTApp(App):
         width: 37;
     }
 
-    /* ------------------------------------ */
-    /* Search */
-    /* ------------------------------------ */
+    /* INPUTS */
+
+    Input {
+        background: #16232e;
+        color: #e5ebed;
+        border: tall #304352;
+    }
+
+    Input:focus {
+        border: tall #ac9b79;
+    }
+
+    Checkbox {
+        color: #aabac4;
+    }
+
+    /* SEARCH */
 
     #search_row {
         height: 3;
@@ -1175,23 +1144,7 @@ class DLTApp(App):
         height: 3;
     }
 
-    Input, Select {
-        background: #16232e;
-        color: #e5ebed;
-        border: tall #304352;
-    }
-
-    Input:focus, Select:focus {
-        border: tall #ac9b79;
-    }
-
-    Checkbox {
-        color: #aabac4;
-    }
-
-    /* ------------------------------------ */
-    /* Summary */
-    /* ------------------------------------ */
+    /* SUMMARY */
 
     #summary {
         height: 3;
@@ -1203,9 +1156,7 @@ class DLTApp(App):
         color: #d7e0e4;
     }
 
-    /* ------------------------------------ */
-    /* Catalog */
-    /* ------------------------------------ */
+    /* CATALOG */
 
     #catalog_panel {
         height: 1fr;
@@ -1257,9 +1208,7 @@ class DLTApp(App):
         background: #14212b;
     }
 
-    /* ------------------------------------ */
-    /* Progress */
-    /* ------------------------------------ */
+    /* PROGRESS */
 
     #progress_panel {
         height: 4;
@@ -1278,9 +1227,7 @@ class DLTApp(App):
         height: 2;
     }
 
-    /* ------------------------------------ */
-    /* Activity */
-    /* ------------------------------------ */
+    /* ACTIVITY */
 
     #activity_panel {
         height: 8;
@@ -1311,9 +1258,9 @@ class DLTApp(App):
         ("ctrl+q", "quit", "Quit"),
     ]
 
-    # --------------------------------------------------------
+    # ========================================================
     # STATE
-    # --------------------------------------------------------
+    # ========================================================
 
     def __init__(self):
 
@@ -1337,41 +1284,11 @@ class DLTApp(App):
             "failed": 0,
         }
 
-    # --------------------------------------------------------
+    # ========================================================
     # LAYOUT
-    # --------------------------------------------------------
+    # ========================================================
 
     def compose(self) -> ComposeResult:
-
-        # ----------------------------------------------------
-        # Ensure the selected category text remains visible.
-        # ----------------------------------------------------
-
-        class VisibleCategorySelect(Select):
-
-            DEFAULT_CSS = """
-            VisibleCategorySelect {
-                color: #ffffff;
-                background: #16232e;
-            }
-
-            VisibleCategorySelect SelectCurrent {
-                color: #ffffff;
-                background: #16232e;
-                text-style: bold;
-            }
-
-            VisibleCategorySelect SelectCurrent > Static {
-                color: #ffffff;
-                background: #16232e;
-                text-style: bold;
-            }
-
-            VisibleCategorySelect SelectOverlay {
-                color: #e5ebed;
-                background: #16232e;
-            }
-            """
 
         yield Header(show_clock=True)
 
@@ -1384,9 +1301,7 @@ class DLTApp(App):
                 id="brand",
             )
 
-            # ------------------------------------------------
-            # CATEGORY & OUTPUT
-            # ------------------------------------------------
+            # CATEGORY / OUTPUT
 
             with Horizontal(id="configuration"):
 
@@ -1397,23 +1312,38 @@ class DLTApp(App):
                         classes="input_label",
                     )
 
-                    category_select = VisibleCategorySelect(
+                    # compact=True removes SelectCurrent's
+                    # built-in border. The outer #category
+                    # element provides the only border.
+
+                    yield Select(
                         options=[
-                            ("All categories", "ALL"),
-                            ("1.1  Registration & Tax", "1.1"),
-                            ("1.2  Vehicle Registration", "1.2"),
-                            ("1.3  New Registration", "1.3"),
-                            ("1.4  Accumulated Registration", "1.4"),
+                            (
+                                "All categories",
+                                "ALL",
+                            ),
+                            (
+                                "1.1  Registration & Tax",
+                                "1.1",
+                            ),
+                            (
+                                "1.2  Vehicle Registration",
+                                "1.2",
+                            ),
+                            (
+                                "1.3  New Registration",
+                                "1.3",
+                            ),
+                            (
+                                "1.4  Accumulated Registration",
+                                "1.4",
+                            ),
                         ],
                         value="ALL",
                         allow_blank=False,
+                        compact=True,
                         id="category",
                     )
-
-                    category_select.styles.color = "#ffffff"
-                    category_select.styles.background = "#16232e"
-
-                    yield category_select
 
                 with Vertical(id="output_group"):
 
@@ -1428,9 +1358,7 @@ class DLTApp(App):
                         id="output",
                     )
 
-            # ------------------------------------------------
-            # MAIN ACTIONS
-            # ------------------------------------------------
+            # ACTIONS
 
             with Horizontal(id="actions"):
 
@@ -1459,9 +1387,7 @@ class DLTApp(App):
                     id="settings_button",
                 )
 
-            # ------------------------------------------------
             # ADVANCED OPTIONS
-            # ------------------------------------------------
 
             with Vertical(id="advanced"):
 
@@ -1502,9 +1428,7 @@ class DLTApp(App):
                         id="insecure",
                     )
 
-            # ------------------------------------------------
             # SEARCH
-            # ------------------------------------------------
 
             with Horizontal(id="search_row"):
 
@@ -1514,13 +1438,13 @@ class DLTApp(App):
                 )
 
                 yield Input(
-                    placeholder="Filter by dataset, period or file ID...",
+                    placeholder=(
+                        "Filter by dataset, period or file ID..."
+                    ),
                     id="search",
                 )
 
-            # ------------------------------------------------
             # SUMMARY
-            # ------------------------------------------------
 
             yield Static(
                 "AVAILABLE   0        "
@@ -1530,9 +1454,7 @@ class DLTApp(App):
                 id="summary",
             )
 
-            # ------------------------------------------------
-            # DATA CATALOG
-            # ------------------------------------------------
+            # TABLE
 
             with Vertical(id="catalog_panel"):
 
@@ -1554,9 +1476,7 @@ class DLTApp(App):
                     zebra_stripes=True,
                 )
 
-            # ------------------------------------------------
             # PROGRESS
-            # ------------------------------------------------
 
             with Vertical(id="progress_panel"):
 
@@ -1572,9 +1492,7 @@ class DLTApp(App):
                     id="progress",
                 )
 
-            # ------------------------------------------------
-            # ACTIVITY LOG
-            # ------------------------------------------------
+            # LOG
 
             with Vertical(id="activity_panel"):
 
@@ -1593,41 +1511,9 @@ class DLTApp(App):
 
         yield Footer()
 
-        # ----------------------------------------------------
-        # Explicitly style Textual's internal Select widgets.
-        # This corrects invisible selected text caused by
-        # conflicting theme / SelectCurrent styles.
-        # ----------------------------------------------------
-
-        def ensure_category_visibility() -> None:
-
-            try:
-                picker = self.query_one(
-                    "#category",
-                    Select,
-                )
-
-                picker.styles.color = "#ffffff"
-                picker.styles.background = "#16232e"
-
-                for widget in picker.query("SelectCurrent"):
-
-                    widget.styles.color = "#ffffff"
-                    widget.styles.background = "#16232e"
-                    widget.styles.text_style = "bold"
-
-                    for child in widget.query("*"):
-                        child.styles.color = "#ffffff"
-
-            except Exception:
-                pass
-
-        self.call_later(ensure_category_visibility)
-
-
-    # --------------------------------------------------------
+    # ========================================================
     # INITIALIZATION
-    # --------------------------------------------------------
+    # ========================================================
 
     def on_mount(self) -> None:
 
@@ -1660,23 +1546,19 @@ class DLTApp(App):
 
         self.write_log(
             "Application initialized.",
-            "info",
         )
 
         self.write_log(
             "Connecting to DLT catalog...",
-            "info",
         )
 
-        # Automatically discover the catalog.
-        # No manual button click required.
         self.call_later(
             self.action_discover
         )
 
-    # --------------------------------------------------------
+    # ========================================================
     # UI HELPERS
-    # --------------------------------------------------------
+    # ========================================================
 
     def write_log(
         self,
@@ -1718,9 +1600,7 @@ class DLTApp(App):
         self.query_one(
             "#status",
             Static,
-        ).update(
-            escape(message)
-        )
+        ).update(message)
 
     def set_busy(
         self,
@@ -1807,9 +1687,9 @@ class DLTApp(App):
             ),
         )
 
-    # --------------------------------------------------------
-    # CATALOG TABLE
-    # --------------------------------------------------------
+    # ========================================================
+    # TABLE
+    # ========================================================
 
     def refresh_table(self) -> None:
 
@@ -1877,19 +1757,15 @@ class DLTApp(App):
             self.row_keys[job.key] = row_key
 
         if self.visible_jobs:
-
-            # Select the first available item by default.
             self.selected_job = self.visible_jobs[0]
 
         self.query_one(
             "#catalog_info",
             Static,
         ).update(
-            (
-                f"{len(self.visible_jobs):,} visible"
-                "  /  "
-                f"{len(self.all_jobs):,} total"
-            )
+            f"{len(self.visible_jobs):,} visible"
+            "  /  "
+            f"{len(self.all_jobs):,} total"
         )
 
         self.update_summary()
@@ -1904,15 +1780,12 @@ class DLTApp(App):
 
         self.job_status[job.key] = status
 
-        row_key = self.row_keys.get(
-            job.key
-        )
+        row_key = self.row_keys.get(job.key)
 
         if row_key is None:
             return
 
         try:
-
             self.query_one(
                 "#table",
                 DataTable,
@@ -1925,9 +1798,9 @@ class DLTApp(App):
         except Exception:
             pass
 
-    # --------------------------------------------------------
+    # ========================================================
     # EVENTS
-    # --------------------------------------------------------
+    # ========================================================
 
     def on_select_changed(
         self,
@@ -1938,7 +1811,6 @@ class DLTApp(App):
             event.select.id == "category"
             and self.is_mounted
         ):
-
             self.refresh_table()
 
     def on_input_changed(
@@ -1950,7 +1822,6 @@ class DLTApp(App):
             event.input.id == "search"
             and self.is_mounted
         ):
-
             self.refresh_table()
 
     def on_data_table_row_highlighted(
@@ -1959,14 +1830,10 @@ class DLTApp(App):
     ) -> None:
 
         try:
-
             index = int(
                 str(event.row_key.value)
             )
-
-            self.selected_job = (
-                self.visible_jobs[index]
-            )
+            self.selected_job = self.visible_jobs[index]
 
         except (
             IndexError,
@@ -1974,7 +1841,6 @@ class DLTApp(App):
             AttributeError,
             TypeError,
         ):
-
             self.selected_job = None
 
     def on_data_table_row_selected(
@@ -1983,14 +1849,11 @@ class DLTApp(App):
     ) -> None:
 
         try:
-
             index = int(
                 str(event.row_key.value)
             )
 
-            self.selected_job = (
-                self.visible_jobs[index]
-            )
+            self.selected_job = self.visible_jobs[index]
 
             self.set_status(
                 "SELECTED  /  "
@@ -2015,23 +1878,18 @@ class DLTApp(App):
         button_id = event.button.id
 
         if button_id == "refresh":
-
             self.action_discover()
 
         elif button_id == "download_all":
-
             self.action_download_all()
 
         elif button_id == "download_selected":
-
             self.action_download_selected()
 
         elif button_id == "stop":
-
             self.action_stop()
 
         elif button_id == "settings_button":
-
             self.toggle_settings()
 
     def toggle_settings(self) -> None:
@@ -2054,9 +1912,9 @@ class DLTApp(App):
             else "OPTIONS"
         )
 
-    # --------------------------------------------------------
+    # ========================================================
     # DISCOVERY
-    # --------------------------------------------------------
+    # ========================================================
 
     def action_discover(self) -> None:
 
@@ -2064,7 +1922,6 @@ class DLTApp(App):
             return
 
         self.stop_event.clear()
-
         self.set_busy(True)
 
         self.set_progress(0, 4)
@@ -2162,7 +2019,6 @@ class DLTApp(App):
             )
 
         finally:
-
             session.close()
 
     def discovery_finished(
@@ -2192,26 +2048,22 @@ class DLTApp(App):
         if errors:
 
             self.write_log(
-                (
-                    f"Catalog loaded with "
-                    f"{errors} category errors."
-                ),
+                f"Catalog loaded with "
+                f"{errors} category errors.",
                 "warning",
             )
 
         else:
 
             self.write_log(
-                (
-                    f"Catalog ready. "
-                    f"{len(jobs):,} files available."
-                ),
+                f"Catalog ready. "
+                f"{len(jobs):,} files available.",
                 "success",
             )
 
-    # --------------------------------------------------------
+    # ========================================================
     # DOWNLOAD ACTIONS
-    # --------------------------------------------------------
+    # ========================================================
 
     def action_download_all(self) -> None:
 
@@ -2233,7 +2085,6 @@ class DLTApp(App):
                 "Select a file from the catalog first.",
                 "warning",
             )
-
             return
 
         self.start_download(
@@ -2251,7 +2102,6 @@ class DLTApp(App):
                 "No files available for download.",
                 "warning",
             )
-
             return
 
         try:
@@ -2279,7 +2129,6 @@ class DLTApp(App):
                 "Invalid limit or delay setting.",
                 "error",
             )
-
             return
 
         output_value = self.query_one(
@@ -2293,7 +2142,6 @@ class DLTApp(App):
                 "Output directory cannot be empty.",
                 "error",
             )
-
             return
 
         if limit:
@@ -2335,11 +2183,7 @@ class DLTApp(App):
         )
 
         self.write_log(
-            (
-                f"Starting download "
-                f"of {len(jobs)} files."
-            ),
-            "info",
+            f"Starting download of {len(jobs)} files."
         )
 
         self.download_worker(
@@ -2350,9 +2194,9 @@ class DLTApp(App):
             delay,
         )
 
-    # --------------------------------------------------------
+    # ========================================================
     # DOWNLOAD WORKER
-    # --------------------------------------------------------
+    # ========================================================
 
     @work(
         thread=True,
@@ -2379,10 +2223,7 @@ class DLTApp(App):
                 exist_ok=True,
             )
 
-            manifest = (
-                output
-                / "manifest.csv"
-            )
+            manifest = output / "manifest.csv"
 
             write_header = (
                 not manifest.exists()
@@ -2401,7 +2242,6 @@ class DLTApp(App):
                 )
 
                 if write_header:
-
                     writer.writeheader()
                     file.flush()
 
@@ -2482,9 +2322,9 @@ class DLTApp(App):
                 len(jobs),
             )
 
-    # --------------------------------------------------------
+    # ========================================================
     # LIVE RESULTS
-    # --------------------------------------------------------
+    # ========================================================
 
     def handle_result(
         self,
@@ -2523,7 +2363,6 @@ class DLTApp(App):
                     f"{processed}/{total}  "
                     f"Skipped file {job.file_id}"
                 ),
-                "info",
             )
 
         elif status == "stopped":
@@ -2585,9 +2424,9 @@ class DLTApp(App):
             "success",
         )
 
-    # --------------------------------------------------------
+    # ========================================================
     # STOP
-    # --------------------------------------------------------
+    # ========================================================
 
     def action_stop(self) -> None:
 
@@ -2608,13 +2447,11 @@ class DLTApp(App):
 
 
 # ============================================================
-# MAIN
+# ENTRY POINT
 # ============================================================
 
 def main() -> None:
-
-    app = DLTApp()
-    app.run()
+    DLTApp().run()
 
 
 if __name__ == "__main__":
