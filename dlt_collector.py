@@ -3,14 +3,20 @@
 # -*- coding: utf-8 -*-
 
 """
-DLT Statistics Collector
-Professional Terminal UI
+DLT STATISTICS COLLECTOR
+Professional Terminal Interface
 
 INSTALL:
-    python -m pip install -r requirements.txt
+    python -m pip install -U textual rich requests beautifulsoup4 truststore
 
 RUN:
     python dlt_collector.py
+
+SHORTCUTS:
+    Ctrl+R  Refresh catalog
+    Ctrl+D  Download visible files
+    Ctrl+S  Stop operation
+    Ctrl+Q  Quit
 """
 
 from __future__ import annotations
@@ -52,6 +58,7 @@ from textual.widgets import (
     Footer,
     Header,
     Input,
+    Label,
     ProgressBar,
     RichLog,
     Select,
@@ -70,40 +77,40 @@ DOWNLOAD_URL = (
 )
 
 CATEGORIES = {
-    "1.1": (
-        "Registration & Tax",
-        "m1_stat_car.php",
-        4,
-        "01_Registration_Tax",
-    ),
-    "1.2": (
-        "Vehicle Registration",
-        "m1_new_car.php",
-        1,
-        "02_Vehicle_Registration",
-    ),
-    "1.3": (
-        "New Vehicle Registration",
-        "m1_new_car_red.php",
-        2,
-        "03_New_Registration",
-    ),
-    "1.4": (
-        "Accumulated Registration",
-        "m1_collect_new_car.php",
-        3,
-        "04_Accumulated_Registration",
-    ),
+    "1.1": {
+        "name": "Registration & Tax",
+        "endpoint": "m1_stat_car.php",
+        "type_id": 4,
+        "directory": "01_Registration_Tax",
+    },
+    "1.2": {
+        "name": "Vehicle Registration",
+        "endpoint": "m1_new_car.php",
+        "type_id": 1,
+        "directory": "02_Vehicle_Registration",
+    },
+    "1.3": {
+        "name": "New Vehicle Registration",
+        "endpoint": "m1_new_car_red.php",
+        "type_id": 2,
+        "directory": "03_New_Registration",
+    },
+    "1.4": {
+        "name": "Accumulated Registration",
+        "endpoint": "m1_collect_new_car.php",
+        "type_id": 3,
+        "directory": "04_Accumulated_Registration",
+    },
 }
 
-MANIFEST_FIELDS = [
+MANIFEST_COLUMNS = [
     "timestamp",
     "category",
     "topic",
     "subtopic",
-    "dropdown",
-    "data_file",
-    "source_url",
+    "period",
+    "file_id",
+    "request_url",
     "final_url",
     "file_path",
     "file_size",
@@ -112,7 +119,7 @@ MANIFEST_FIELDS = [
     "error",
 ]
 
-EXCEL_SUFFIXES = {
+EXCEL_EXTENSIONS = {
     ".xls",
     ".xlsx",
     ".xlsm",
@@ -123,13 +130,15 @@ INVALID_FILENAME = re.compile(
     r'[<>:"/\\|?*\x00-\x1f]'
 )
 
+DEFAULT_DELAY = 0.8
+
 
 # ============================================================
-# DATA MODEL
+# MODELS
 # ============================================================
 
 @dataclass(frozen=True)
-class Job:
+class DownloadJob:
     category: str
     topic: str
     subtopic: str
@@ -153,23 +162,23 @@ class Job:
         )
 
 
-class InterruptedDownload(Exception):
+class DownloadInterrupted(Exception):
     pass
 
 
 # ============================================================
-# UTILITIES
+# HELPERS
 # ============================================================
 
-def safe_part(
+def safe_filename(
     value: str,
-    length: int = 52,
+    max_length: int = 54,
 ) -> str:
 
     value = re.sub(
         r"\s+",
         " ",
-        value,
+        str(value),
     ).strip().lstrip("- ")
 
     value = INVALID_FILENAME.sub(
@@ -178,64 +187,91 @@ def safe_part(
     ).rstrip(" .")
 
     return (
-        value[:length].rstrip(" .")
+        value[:max_length].rstrip(" .")
         or "unknown"
     )
 
 
-def filename_header(
-    value: str,
+def timestamp() -> str:
+
+    return (
+        datetime.now()
+        .astimezone()
+        .isoformat(timespec="seconds")
+    )
+
+
+def sha256_file(path: Path) -> str:
+
+    digest = hashlib.sha256()
+
+    with path.open("rb") as file:
+
+        for chunk in iter(
+            lambda: file.read(1024 * 1024),
+            b"",
+        ):
+            digest.update(chunk)
+
+    return digest.hexdigest()
+
+
+def extract_filename(
+    disposition: str,
 ) -> str | None:
 
     match = re.search(
         r"filename\*\s*=\s*(?:UTF-8'')?([^;]+)",
-        value,
+        disposition,
         re.I,
     )
 
     if match:
-        name = unquote(
+
+        value = unquote(
             match.group(1).strip().strip('"')
         )
+
         return re.split(
             r"[/\\]",
-            name,
+            value,
         )[-1]
 
     match = re.search(
         r'filename\s*=\s*(?:"([^"]+)"|([^;]+))',
-        value,
+        disposition,
         re.I,
     )
 
     if match:
-        name = (
+
+        value = (
             match.group(1)
             or match.group(2)
         ).strip()
 
         return re.split(
             r"[/\\]",
-            name,
+            value,
         )[-1]
 
     return None
 
 
-def identify_excel(
+def detect_excel(
     path: Path,
-    mime: str = "",
+    content_type: str = "",
     disposition: str = "",
 ) -> str | None:
 
-    if (
-        not path.is_file()
-        or path.stat().st_size == 0
-    ):
+    if not path.is_file():
         return None
 
-    with path.open("rb") as stream:
-        signature = stream.read(512)
+    if path.stat().st_size == 0:
+        return None
+
+    with path.open("rb") as file:
+        signature = file.read(512)
 
     if signature.startswith(
         bytes.fromhex("D0CF11E0A1B11AE1")
@@ -243,49 +279,54 @@ def identify_excel(
         return ".xls"
 
     if signature.startswith(b"PK"):
-        if zipfile.is_zipfile(path):
 
-            try:
-                with zipfile.ZipFile(path) as archive:
+        if not zipfile.is_zipfile(path):
+            return None
 
-                    names = set(
-                        archive.namelist()
-                    )
+        try:
 
-                    if "xl/workbook.bin" in names:
-                        return ".xlsb"
+            with zipfile.ZipFile(path) as archive:
 
-                    if "xl/workbook.xml" in names:
+                names = set(
+                    archive.namelist()
+                )
 
-                        types = ""
+                if "xl/workbook.bin" in names:
+                    return ".xlsb"
 
-                        if "[Content_Types].xml" in names:
-                            types = archive.read(
-                                "[Content_Types].xml"
-                            ).decode(
-                                "utf-8",
-                                "replace",
-                            )
+                if "xl/workbook.xml" in names:
 
-                        if "macroEnabled" in types:
-                            return ".xlsm"
+                    types = ""
 
-                        return ".xlsx"
+                    if "[Content_Types].xml" in names:
 
-            except (
-                OSError,
-                zipfile.BadZipFile,
-            ):
-                return None
+                        types = archive.read(
+                            "[Content_Types].xml"
+                        ).decode(
+                            "utf-8",
+                            errors="replace",
+                        )
+
+                    if "macroEnabled" in types:
+                        return ".xlsm"
+
+                    return ".xlsx"
+
+        except (
+            zipfile.BadZipFile,
+            OSError,
+            KeyError,
+        ):
+            return None
 
     original = (
-        filename_header(disposition)
+        extract_filename(disposition)
         or ""
     ).lower()
 
     if (
         original.endswith(".xls")
-        and "excel" in mime.lower()
+        and "excel" in content_type.lower()
     ):
         if (
             b"<html" in signature.lower()
@@ -296,22 +337,7 @@ def identify_excel(
     return None
 
 
-def hash_file(path: Path) -> str:
-
-    digest = hashlib.sha256()
-
-    with path.open("rb") as stream:
-
-        for chunk in iter(
-            lambda: stream.read(1024 * 1024),
-            b"",
-        ):
-            digest.update(chunk)
-
-    return digest.hexdigest()
-
-
-def spreadsheet_export(
+def google_sheets_export(
     url: str,
     page: str,
 ) -> str | None:
@@ -336,8 +362,8 @@ def spreadsheet_export(
 # HTTP CLIENT
 # ============================================================
 
-def new_session(
-    insecure: bool,
+def create_session(
+    insecure: bool = False,
 ) -> requests.Session:
 
     session = requests.Session()
@@ -348,18 +374,20 @@ def new_session(
             "(Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 "
             "(KHTML, like Gecko) "
-            "Chrome/157.0.0.0 "
-            "Safari/537.36"
+            "Chrome/157.0.0.0 Safari/537.36"
         ),
         "Accept": "*/*",
         "Accept-Language": (
-            "th-TH,th;q=0.9,en;q=0.7"
+            "th-TH,th;q=0.9,en;q=0.8"
         ),
         "Referer": BASE_URL,
     })
 
     retry = Retry(
         total=3,
+        connect=3,
+        read=3,
+        status=3,
         backoff_factor=1.3,
         status_forcelist=[
             429,
@@ -389,6 +417,7 @@ def new_session(
     session.verify = not insecure
 
     if insecure:
+
         import urllib3
 
         urllib3.disable_warnings(
@@ -399,44 +428,42 @@ def new_session(
 
 
 # ============================================================
-# CATALOG EXTRACTION
+# CATALOG PARSER
 # ============================================================
 
-def catalog_rows(
-    elements,
+def parse_rows(
+    rows,
     category: str,
     topic: str | None = None,
-    topic_index: int = 0,
-) -> list[Job]:
+    topic_number: int = 0,
+) -> list[DownloadJob]:
 
-    _, _, type_id, category_dir = (
-        CATEGORIES[category]
-    )
+    config = CATEGORIES[category]
 
     jobs = []
 
-    for number, element in enumerate(
-        elements,
-        1,
+    for row_number, row in enumerate(
+        rows,
+        start=1,
     ):
 
-        heading = element.select_one(
+        title = row.select_one(
             "div.col-lg-8"
         )
 
-        if heading is None:
+        if title is None:
             continue
 
-        label = heading.get_text(
+        label = title.get_text(
             " ",
             strip=True,
         ).lstrip("- ").strip()
 
-        dropdown = element.select_one(
+        dropdown = row.select_one(
             "select"
         )
 
-        button = element.select_one(
+        button = row.select_one(
             "button[value]"
         )
 
@@ -445,23 +472,32 @@ def catalog_rows(
 
         if topic is None:
 
-            parent = label
-            subtopic = ""
+            current_topic = label
+            current_subtopic = ""
 
             directory = (
-                Path(category_dir)
-                / f"{number:02d}_{safe_part(label)}"
+                Path(config["directory"])
+                / (
+                    f"{row_number:02d}_"
+                    f"{safe_filename(label)}"
+                )
             )
 
         else:
 
-            parent = topic
-            subtopic = label
+            current_topic = topic
+            current_subtopic = label
 
             directory = (
-                Path(category_dir)
-                / f"{topic_index:02d}_{safe_part(topic)}"
-                / f"{number:02d}_{safe_part(label)}"
+                Path(config["directory"])
+                / (
+                    f"{topic_number:02d}_"
+                    f"{safe_filename(topic)}"
+                )
+                / (
+                    f"{row_number:02d}_"
+                    f"{safe_filename(label)}"
+                )
             )
 
         if dropdown is not None:
@@ -483,16 +519,16 @@ def catalog_rows(
                     continue
 
                 jobs.append(
-                    Job(
+                    DownloadJob(
                         category=category,
-                        topic=parent,
-                        subtopic=subtopic,
+                        topic=current_topic,
+                        subtopic=current_subtopic,
                         period=period,
                         file_id=file_id,
-                        type_id=type_id,
+                        type_id=config["type_id"],
                         directory=(
                             directory
-                            / safe_part(period)
+                            / safe_filename(period)
                         ),
                     )
                 )
@@ -507,13 +543,13 @@ def catalog_rows(
                 continue
 
             jobs.append(
-                Job(
+                DownloadJob(
                     category=category,
-                    topic=parent,
-                    subtopic=subtopic,
+                    topic=current_topic,
+                    subtopic=current_subtopic,
                     period="Direct download",
                     file_id=file_id,
-                    type_id=type_id,
+                    type_id=config["type_id"],
                     directory=(
                         directory
                         / "Direct_Download"
@@ -527,7 +563,7 @@ def catalog_rows(
 def parse_catalog(
     html: str,
     category: str,
-) -> list[Job]:
+) -> list[DownloadJob]:
 
     soup = BeautifulSoup(
         html,
@@ -540,48 +576,50 @@ def parse_catalog(
 
     if not accordions:
 
-        return catalog_rows(
+        return parse_rows(
             soup.select("div.row.border"),
             category,
         )
 
     jobs = []
 
-    for index, card in enumerate(
+    for number, card in enumerate(
         accordions,
-        1,
+        start=1,
     ):
 
-        title = card.select_one(
+        heading = card.select_one(
             ".card-header span.l"
         )
 
-        if title is None:
+        if heading is None:
             continue
 
         jobs.extend(
-            catalog_rows(
-                elements=card.select(
+            parse_rows(
+                rows=card.select(
                     "div.row.border"
                 ),
                 category=category,
-                topic=title.get_text(
+                topic=heading.get_text(
                     " ",
                     strip=True,
                 ),
-                topic_index=index,
+                topic_number=number,
             )
         )
 
     return jobs
 
 
-def fetch_catalog(
+def fetch_category(
     session: requests.Session,
     category: str,
-) -> list[Job]:
+) -> list[DownloadJob]:
 
-    _, endpoint, _, _ = CATEGORIES[category]
+    endpoint = CATEGORIES[category][
+        "endpoint"
+    ]
 
     response = session.get(
         BASE_URL + endpoint,
@@ -594,25 +632,24 @@ def fetch_catalog(
     response.raise_for_status()
     response.encoding = "utf-8"
 
-    found = parse_catalog(
+    jobs = parse_catalog(
         response.text,
         category,
     )
 
-    if not found:
-        raise ValueError(
-            "No downloadable entries "
-            f"in category {category}"
+    if not jobs:
+        raise RuntimeError(
+            f"No downloadable entries: {category}"
         )
 
-    return found
+    return jobs
 
 
 # ============================================================
 # DOWNLOAD ENGINE
 # ============================================================
 
-def existing_excel(
+def find_existing(
     directory: Path,
     file_id: str,
 ) -> Path | None:
@@ -625,20 +662,21 @@ def existing_excel(
     ):
 
         if (
-            path.suffix.lower() in EXCEL_SUFFIXES
-            and identify_excel(path)
+            path.is_file()
+            and path.suffix.lower() in EXCEL_EXTENSIONS
+            and detect_excel(path)
         ):
             return path
 
     return None
 
 
-def retrieve(
+def stream_download(
     session: requests.Session,
     url: str,
     parameters: dict | None,
-    destination: Path,
-    stop: threading.Event,
+    temporary: Path,
+    stop_event: threading.Event,
 ) -> tuple[str, str, str]:
 
     with session.get(
@@ -653,7 +691,7 @@ def retrieve(
 
         final_url = response.url
 
-        mime = response.headers.get(
+        content_type = response.headers.get(
             "Content-Type",
             "",
         )
@@ -663,26 +701,30 @@ def retrieve(
             "",
         )
 
-        with destination.open("wb") as stream:
+        with temporary.open("wb") as file:
 
-            for data in response.iter_content(
-                128 * 1024
+            for chunk in response.iter_content(
+                chunk_size=128 * 1024
             ):
 
-                if stop.is_set():
-                    raise InterruptedDownload()
+                if stop_event.is_set():
+                    raise DownloadInterrupted()
 
-                if data:
-                    stream.write(data)
+                if chunk:
+                    file.write(chunk)
 
-    return final_url, mime, disposition
+    return (
+        final_url,
+        content_type,
+        disposition,
+    )
 
 
-def download_job(
+def download_file(
     session: requests.Session,
-    job: Job,
+    job: DownloadJob,
     root: Path,
-    stop: threading.Event,
+    stop_event: threading.Event,
     force: bool,
 ) -> dict:
 
@@ -699,24 +741,20 @@ def download_job(
         "data_file": job.file_id,
     }
 
-    url = requests.Request(
+    request_url = requests.Request(
         "GET",
         DOWNLOAD_URL,
         params=params,
     ).prepare().url
 
     result = {
-        "timestamp": (
-            datetime.now()
-            .astimezone()
-            .isoformat(timespec="seconds")
-        ),
+        "timestamp": timestamp(),
         "category": job.category,
         "topic": job.topic,
         "subtopic": job.subtopic,
-        "dropdown": job.period,
-        "data_file": job.file_id,
-        "source_url": url,
+        "period": job.period,
+        "file_id": job.file_id,
+        "request_url": request_url,
         "final_url": "",
         "file_path": "",
         "file_size": 0,
@@ -725,17 +763,17 @@ def download_job(
         "error": "",
     }
 
-    old_file = existing_excel(
+    existing = find_existing(
         directory,
         job.file_id,
     )
 
-    if old_file and not force:
+    if existing and not force:
 
         result.update(
             status="skipped",
-            file_path=str(old_file),
-            file_size=old_file.stat().st_size,
+            file_path=str(existing),
+            file_size=existing.stat().st_size,
         )
 
         return result
@@ -747,70 +785,80 @@ def download_job(
 
     try:
 
-        if stop.is_set():
-            raise InterruptedDownload()
+        if stop_event.is_set():
+            raise DownloadInterrupted()
 
-        final, mime, disposition = retrieve(
+        (
+            final_url,
+            content_type,
+            disposition,
+        ) = stream_download(
             session,
             DOWNLOAD_URL,
             params,
             temporary,
-            stop,
+            stop_event,
         )
 
-        result["final_url"] = final
+        result["final_url"] = final_url
 
-        suffix = identify_excel(
+        extension = detect_excel(
             temporary,
-            mime,
+            content_type,
             disposition,
         )
 
-        if suffix is None:
+        if extension is None:
 
-            with temporary.open("rb") as stream:
+            with temporary.open("rb") as file:
 
-                page = stream.read(
+                html = file.read(
                     1024 * 1024
                 ).decode(
                     "utf-8",
-                    "replace",
+                    errors="replace",
                 )
 
-            export = spreadsheet_export(
-                final,
-                page,
+            export_url = google_sheets_export(
+                final_url,
+                html,
             )
 
-            if export and export != final:
+            if export_url and export_url != final_url:
 
-                final, mime, disposition = retrieve(
+                (
+                    final_url,
+                    content_type,
+                    disposition,
+                ) = stream_download(
                     session,
-                    export,
+                    export_url,
                     None,
                     temporary,
-                    stop,
+                    stop_event,
                 )
 
-                result["final_url"] = final
+                result["final_url"] = final_url
 
-                suffix = identify_excel(
+                extension = detect_excel(
                     temporary,
-                    mime,
+                    content_type,
                     disposition,
                 )
 
-        if suffix is None:
+        if extension is None:
 
-            debug = root / "_debug"
+            debug_directory = (
+                root / "_debug"
+            )
 
-            debug.mkdir(
+            debug_directory.mkdir(
                 parents=True,
                 exist_ok=True,
             )
 
             debug_file = (
-                debug
+                debug_directory
                 / (
                     f"{job.category.replace('.', '_')}_"
                     f"{job.file_id}.response"
@@ -822,65 +870,63 @@ def download_job(
             result.update(
                 status="not_excel",
                 error=(
-                    f"Unexpected file format: "
-                    f"{mime}; {final}"
+                    f"Unexpected response: "
+                    f"{content_type}; {final_url}"
                 ),
             )
 
             return result
 
         original = (
-            filename_header(disposition)
+            extract_filename(disposition)
             or "statistics"
         )
 
         filename = (
             f"DLT_{job.file_id}_"
-            f"{safe_part(Path(original).stem)}"
-            f"{suffix}"
+            f"{safe_filename(Path(original).stem)}"
+            f"{extension}"
         )
 
-        output = directory / filename
+        destination = directory / filename
 
-        temporary.replace(output)
+        temporary.replace(destination)
 
         if (
             force
-            and old_file
-            and old_file != output
+            and existing
+            and existing != destination
         ):
-            old_file.unlink(missing_ok=True)
+            existing.unlink(missing_ok=True)
 
         result.update(
             status="downloaded",
-            file_path=str(output),
-            file_size=output.stat().st_size,
-            sha256=hash_file(output),
+            file_path=str(destination),
+            file_size=destination.stat().st_size,
+            sha256=sha256_file(destination),
         )
 
         return result
 
-    except InterruptedDownload:
+    except DownloadInterrupted:
 
         result["status"] = "stopped"
         return result
 
-    except requests.exceptions.SSLError as exc:
+    except requests.exceptions.SSLError as error:
 
         result.update(
             status="ssl_error",
-            error=str(exc),
+            error=str(error),
         )
 
         return result
 
-    except Exception as exc:
+    except Exception as error:
 
         result.update(
             status="error",
-            error=(
-                f"{type(exc).__name__}: {exc}"
-            ),
+            error=f"{type(error).__name__}: {error}",
         )
 
         return result
@@ -893,132 +939,141 @@ def download_job(
 
 
 # ============================================================
-# TERMINAL APPLICATION
+# TERMINAL UI
 # ============================================================
 
 class DLTApp(App):
 
-    TITLE = "DLT / Statistics"
-    SUB_TITLE = "Vehicle Registration Data"
+    TITLE = "DLT Statistics"
+    SUB_TITLE = "Data Collection Workspace"
 
     CSS = """
     Screen {
-        background: #0b1016;
-        color: #dbe3e8;
+        background: #0d141b;
+        color: #dce5e9;
     }
 
     Header {
-        background: #111b26;
-        color: #dbe3e8;
+        background: #17232e;
+        color: #dce5e9;
     }
 
     Footer {
-        background: #111b26;
-        color: #9aacbc;
+        background: #17232e;
+        color: #9aabb6;
     }
 
-    #shell {
+    #workspace {
         height: 1fr;
-        padding: 1 2 0 2;
+        padding: 0 2 1 2;
     }
+
+    /* ------------------------------------ */
+    /* Brand */
+    /* ------------------------------------ */
 
     #brand {
         height: 3;
-        background: #14212c;
-        border-left: thick #b6a27a;
+        margin-top: 1;
+        background: #17232e;
+        border-left: thick #ac9b79;
         padding: 0 2;
-        color: #e8e4d8;
-        text-style: bold;
         content-align: left middle;
+        color: #e9e7df;
+        text-style: bold;
     }
 
-    #toolbar {
-        height: 3;
+    /* ------------------------------------ */
+    /* Source / destination */
+    /* ------------------------------------ */
+
+    #configuration {
+        height: 5;
         margin-top: 1;
     }
+
+    #category_group {
+        width: 38;
+        height: 5;
+        margin-right: 2;
+    }
+
+    #output_group {
+        width: 1fr;
+        height: 5;
+    }
+
+    .input_label {
+        height: 1;
+        color: #93a5b1;
+        text-style: bold;
+        padding-left: 1;
+    }
+
+    #category {
+        width: 100%;
+        height: 3;
+    }
+
+    #output {
+        width: 100%;
+        height: 3;
+    }
+
+    /* ------------------------------------ */
+    /* Action bar */
+    /* ------------------------------------ */
 
     #actions {
         height: 3;
         margin-top: 1;
+        align: left middle;
     }
 
-    #options {
+    #actions Button {
         height: 3;
-        margin-top: 1;
-    }
-
-    .field-label {
-        height: 3;
-        width: auto;
-        padding: 0 1;
-        content-align: left middle;
-        color: #95a5b1;
+        min-height: 3;
+        margin-right: 1;
+        content-align: center middle;
         text-style: bold;
     }
 
-    #category {
-        width: 31;
-        margin-right: 2;
-    }
-
-    #output {
-        width: 1fr;
-        margin-right: 1;
-    }
-
-    #sync {
+    #refresh {
         width: 19;
+        min-width: 19;
     }
 
     #download_all {
         width: 22;
-        margin-right: 1;
+        min-width: 22;
     }
 
     #download_selected {
-        width: 24;
-        margin-right: 1;
+        width: 23;
+        min-width: 23;
     }
 
     #stop {
         width: 12;
-        margin-right: 2;
+        min-width: 12;
     }
 
-    #search {
-        width: 1fr;
-    }
-
-    #limit {
-        width: 11;
-        margin-right: 2;
-    }
-
-    #delay {
-        width: 11;
-        margin-right: 2;
-    }
-
-    #force {
-        width: 23;
-    }
-
-    #insecure {
-        width: 42;
+    #settings_button {
+        width: 15;
+        min-width: 15;
     }
 
     Button {
-        background: #203343;
-        color: #e2e9ec;
-        border: none;
+        background: #263846;
+        color: #e6ebed;
     }
 
     Button:hover {
-        background: #2b4558;
+        background: #344e60;
     }
 
     Button:focus {
-        background: #345268;
+        background: #3c596c;
         color: #ffffff;
     }
 
@@ -1026,141 +1081,232 @@ class DLTApp(App):
         opacity: 0.45;
     }
 
-    #sync {
-        background: #354b61;
+    #refresh {
+        background: #30485a;
     }
 
     #download_all {
-        background: #236b65;
+        background: #23685f;
     }
 
     #download_selected {
-        background: #284b59;
+        background: #285361;
     }
 
     #stop {
-        background: #5a3335;
+        background: #61383b;
+    }
+
+    #settings_button {
+        background: #263846;
+    }
+
+    /* ------------------------------------ */
+    /* Optional settings — hidden initially */
+    /* ------------------------------------ */
+
+    #advanced {
+        display: none;
+        height: 5;
+        margin-top: 1;
+        padding: 0 1;
+        background: #15212b;
+        border-left: solid #405262;
+    }
+
+    #advanced_title {
+        height: 1;
+        color: #ac9b79;
+        text-style: bold;
+    }
+
+    #advanced_row {
+        height: 3;
+        align: left middle;
+    }
+
+    .small_label {
+        width: auto;
+        height: 3;
+        padding: 0 1;
+        content-align: left middle;
+        color: #9fb0ba;
+    }
+
+    #limit {
+        width: 10;
+        margin-right: 2;
+    }
+
+    #delay {
+        width: 10;
+        margin-right: 2;
+    }
+
+    #force {
+        width: 22;
+        margin-right: 2;
+    }
+
+    #insecure {
+        width: 37;
+    }
+
+    /* ------------------------------------ */
+    /* Search */
+    /* ------------------------------------ */
+
+    #search_row {
+        height: 3;
+        margin-top: 1;
+        align: left middle;
+    }
+
+    #search_label {
+        width: 11;
+        height: 3;
+        content-align: left middle;
+        color: #93a5b1;
+        text-style: bold;
+    }
+
+    #search {
+        width: 1fr;
+        height: 3;
     }
 
     Input, Select {
-        background: #131e28;
-        color: #e6ecee;
-        border: tall #273949;
+        background: #16232e;
+        color: #e5ebed;
+        border: tall #304352;
     }
 
     Input:focus, Select:focus {
-        border: tall #b6a27a;
+        border: tall #ac9b79;
     }
 
     Checkbox {
-        color: #aebdc7;
+        color: #aabac4;
     }
+
+    /* ------------------------------------ */
+    /* Summary */
+    /* ------------------------------------ */
 
     #summary {
         height: 3;
         margin-top: 1;
-        margin-bottom: 1;
+        background: #17232e;
+        border: solid #293c49;
+        padding: 0 2;
+        content-align: left middle;
+        color: #d7e0e4;
     }
 
-    .metric {
-        width: 1fr;
-        height: 3;
-        background: #14212c;
-        border: round #263949;
-        text-style: bold;
-        content-align: center middle;
-        margin-right: 1;
-        color: #cbd8df;
-    }
-
-    #metric_failed {
-        margin-right: 0;
-    }
+    /* ------------------------------------ */
+    /* Catalog */
+    /* ------------------------------------ */
 
     #catalog_panel {
         height: 1fr;
-        min-height: 9;
-        border: round #293a49;
-        background: #101922;
+        min-height: 10;
+        margin-top: 1;
+        background: #111c25;
+        border: solid #293c49;
     }
 
-    #catalog_heading {
-        height: 1;
+    #catalog_header {
+        height: 2;
         padding: 0 1;
+        background: #17232e;
+        align: left middle;
     }
 
     #catalog_title {
         width: 1fr;
-        color: #b6a27a;
+        height: 2;
+        content-align: left middle;
+        color: #c8b892;
         text-style: bold;
     }
 
-    #catalog_note {
+    #catalog_info {
         width: 1fr;
-        color: #8ba1b1;
-        text-align: right;
+        height: 2;
+        content-align: right middle;
+        color: #91a5b2;
     }
 
     #table {
         height: 1fr;
-        background: #101922;
+        background: #111c25;
     }
 
     DataTable > .datatable--header {
-        background: #1a2935;
-        color: #c3d0d9;
+        background: #1e2e3a;
+        color: #d9e2e7;
         text-style: bold;
     }
 
     DataTable > .datatable--cursor {
-        background: #294553;
+        background: #345265;
         color: #ffffff;
     }
 
     DataTable > .datatable--odd-row {
-        background: #121e28;
+        background: #14212b;
     }
+
+    /* ------------------------------------ */
+    /* Progress */
+    /* ------------------------------------ */
 
     #progress_panel {
         height: 4;
-        border: round #293a49;
-        padding: 0 1;
         margin-top: 1;
+        padding: 0 1;
+        border: solid #293c49;
+        background: #101a22;
     }
 
-    #operation_status {
+    #status {
         height: 1;
-        color: #c0ced5;
+        color: #c7d3da;
     }
 
     #progress {
         height: 2;
     }
 
-    #log_panel {
+    /* ------------------------------------ */
+    /* Activity */
+    /* ------------------------------------ */
+
+    #activity_panel {
         height: 8;
-        border: round #293a49;
         margin-top: 1;
-        background: #101922;
+        border: solid #293c49;
+        background: #101a22;
     }
 
-    #log_title {
+    #activity_title {
         height: 1;
-        padding: 0 1;
-        color: #b6a27a;
+        padding-left: 1;
+        color: #c8b892;
         text-style: bold;
+        background: #17232e;
     }
 
-    #log {
+    #activity {
         height: 1fr;
         padding: 0 1;
-        background: #101922;
+        background: #101a22;
     }
     """
 
     BINDINGS = [
-        ("ctrl+r", "discover", "Discover"),
-        ("ctrl+d", "download_all", "Download all"),
+        ("ctrl+r", "discover", "Refresh"),
+        ("ctrl+d", "download_all", "Download"),
         ("ctrl+s", "stop", "Stop"),
         ("ctrl+q", "quit", "Quit"),
     ]
@@ -1169,21 +1315,21 @@ class DLTApp(App):
     # STATE
     # --------------------------------------------------------
 
-    def __init__(self) -> None:
+    def __init__(self):
 
         super().__init__()
 
-        self.all_jobs: list[Job] = []
-        self.visible_jobs: list[Job] = []
+        self.all_jobs: list[DownloadJob] = []
+        self.visible_jobs: list[DownloadJob] = []
 
-        self.selected_job: Job | None = None
+        self.selected_job: DownloadJob | None = None
 
-        self.status_by_key: dict[str, str] = {}
-        self.row_by_key: dict[str, str] = {}
+        self.job_status: dict[str, str] = {}
+        self.row_keys: dict[str, str] = {}
+
+        self.stop_event = threading.Event()
 
         self.busy = False
-
-        self.stop_signal = threading.Event()
 
         self.counters = {
             "downloaded": 0,
@@ -1197,56 +1343,101 @@ class DLTApp(App):
 
     def compose(self) -> ComposeResult:
 
+        # ----------------------------------------------------
+        # Ensure the selected category text remains visible.
+        # ----------------------------------------------------
+
+        class VisibleCategorySelect(Select):
+
+            DEFAULT_CSS = """
+            VisibleCategorySelect {
+                color: #ffffff;
+                background: #16232e;
+            }
+
+            VisibleCategorySelect SelectCurrent {
+                color: #ffffff;
+                background: #16232e;
+                text-style: bold;
+            }
+
+            VisibleCategorySelect SelectCurrent > Static {
+                color: #ffffff;
+                background: #16232e;
+                text-style: bold;
+            }
+
+            VisibleCategorySelect SelectOverlay {
+                color: #e5ebed;
+                background: #16232e;
+            }
+            """
+
         yield Header(show_clock=True)
 
-        with Vertical(id="shell"):
+        with Vertical(id="workspace"):
 
             yield Static(
-                "DLT   /   STATISTICS COLLECTION"
-                "       Vehicle Registration · Excel Archive",
+                "DLT  /  STATISTICS COLLECTOR"
+                "                                      "
+                "VEHICLE REGISTRATION DATA",
                 id="brand",
             )
 
-            # Row 1: Source and destination
-            with Horizontal(id="toolbar"):
+            # ------------------------------------------------
+            # CATEGORY & OUTPUT
+            # ------------------------------------------------
 
-                yield Static(
-                    "CATEGORY",
-                    classes="field-label",
-                )
+            with Horizontal(id="configuration"):
 
-                yield Select(
-                    [
-                        ("All categories", "ALL"),
-                    ] + [
-                        (
-                            f"{number}  {info[0]}",
-                            number,
-                        )
-                        for number, info in CATEGORIES.items()
-                    ],
-                    value="ALL",
-                    allow_blank=False,
-                    id="category",
-                )
+                with Vertical(id="category_group"):
 
-                yield Static(
-                    "OUTPUT",
-                    classes="field-label",
-                )
+                    yield Label(
+                        "DATA CATEGORY",
+                        classes="input_label",
+                    )
 
-                yield Input(
-                    value="DLT_Statistics",
-                    id="output",
-                )
+                    category_select = VisibleCategorySelect(
+                        options=[
+                            ("All categories", "ALL"),
+                            ("1.1  Registration & Tax", "1.1"),
+                            ("1.2  Vehicle Registration", "1.2"),
+                            ("1.3  New Registration", "1.3"),
+                            ("1.4  Accumulated Registration", "1.4"),
+                        ],
+                        value="ALL",
+                        allow_blank=False,
+                        id="category",
+                    )
+
+                    category_select.styles.color = "#ffffff"
+                    category_select.styles.background = "#16232e"
+
+                    yield category_select
+
+                with Vertical(id="output_group"):
+
+                    yield Label(
+                        "OUTPUT DIRECTORY",
+                        classes="input_label",
+                    )
+
+                    yield Input(
+                        value="DLT_Statistics",
+                        placeholder="Output directory",
+                        id="output",
+                    )
+
+            # ------------------------------------------------
+            # MAIN ACTIONS
+            # ------------------------------------------------
+
+            with Horizontal(id="actions"):
 
                 yield Button(
-                    "SYNC CATALOG",
-                    id="sync",
+                    "REFRESH CATALOG",
+                    id="refresh",
                 )
-
-            # Row 2: Primary actions
-            with Horizontal(id="actions"):
 
                 yield Button(
                     "DOWNLOAD ALL",
@@ -1263,77 +1454,89 @@ class DLTApp(App):
                     id="stop",
                 )
 
+                yield Button(
+                    "OPTIONS",
+                    id="settings_button",
+                )
+
+            # ------------------------------------------------
+            # ADVANCED OPTIONS
+            # ------------------------------------------------
+
+            with Vertical(id="advanced"):
+
+                yield Static(
+                    "DOWNLOAD OPTIONS",
+                    id="advanced_title",
+                )
+
+                with Horizontal(id="advanced_row"):
+
+                    yield Static(
+                        "LIMIT",
+                        classes="small_label",
+                    )
+
+                    yield Input(
+                        value="0",
+                        id="limit",
+                    )
+
+                    yield Static(
+                        "DELAY (S)",
+                        classes="small_label",
+                    )
+
+                    yield Input(
+                        value=str(DEFAULT_DELAY),
+                        id="delay",
+                    )
+
+                    yield Checkbox(
+                        "Force redownload",
+                        id="force",
+                    )
+
+                    yield Checkbox(
+                        "Allow invalid SSL (unsafe)",
+                        id="insecure",
+                    )
+
+            # ------------------------------------------------
+            # SEARCH
+            # ------------------------------------------------
+
+            with Horizontal(id="search_row"):
+
+                yield Static(
+                    "SEARCH",
+                    id="search_label",
+                )
+
                 yield Input(
-                    placeholder=(
-                        "Search topic, period or file ID..."
-                    ),
+                    placeholder="Filter by dataset, period or file ID...",
                     id="search",
                 )
 
-            # Row 3: Advanced controls
-            with Horizontal(id="options"):
+            # ------------------------------------------------
+            # SUMMARY
+            # ------------------------------------------------
 
-                yield Static(
-                    "LIMIT",
-                    classes="field-label",
-                )
+            yield Static(
+                "AVAILABLE   0        "
+                "DOWNLOADED   0        "
+                "SKIPPED   0        "
+                "FAILED   0",
+                id="summary",
+            )
 
-                yield Input(
-                    value="0",
-                    id="limit",
-                )
+            # ------------------------------------------------
+            # DATA CATALOG
+            # ------------------------------------------------
 
-                yield Static(
-                    "DELAY (S)",
-                    classes="field-label",
-                )
-
-                yield Input(
-                    value="0.8",
-                    id="delay",
-                )
-
-                yield Checkbox(
-                    "Force redownload",
-                    id="force",
-                )
-
-                yield Checkbox(
-                    "Allow invalid SSL (unsafe)",
-                    id="insecure",
-                )
-
-            # Summary cards
-            with Horizontal(id="summary"):
-
-                yield Static(
-                    "AVAILABLE   0",
-                    classes="metric",
-                    id="metric_available",
-                )
-
-                yield Static(
-                    "DOWNLOADED   0",
-                    classes="metric",
-                    id="metric_downloaded",
-                )
-
-                yield Static(
-                    "SKIPPED   0",
-                    classes="metric",
-                    id="metric_skipped",
-                )
-
-                yield Static(
-                    "FAILED   0",
-                    classes="metric",
-                    id="metric_failed",
-                )
-
-            # Main table
             with Vertical(id="catalog_panel"):
 
-                with Horizontal(id="catalog_heading"):
+                with Horizontal(id="catalog_header"):
 
                     yield Static(
                         "FILE CATALOG",
@@ -1341,8 +1544,8 @@ class DLTApp(App):
                     )
 
                     yield Static(
-                        "Select a row to download individually",
-                        id="catalog_note",
+                        "Loading catalog...",
+                        id="catalog_info",
                     )
 
                 yield DataTable(
@@ -1351,12 +1554,15 @@ class DLTApp(App):
                     zebra_stripes=True,
                 )
 
-            # Progress
+            # ------------------------------------------------
+            # PROGRESS
+            # ------------------------------------------------
+
             with Vertical(id="progress_panel"):
 
                 yield Static(
-                    "READY   /   Sync the catalog to begin",
-                    id="operation_status",
+                    "READY  /  Waiting for catalog",
+                    id="status",
                 )
 
                 yield ProgressBar(
@@ -1366,16 +1572,19 @@ class DLTApp(App):
                     id="progress",
                 )
 
-            # Activity log
-            with Vertical(id="log_panel"):
+            # ------------------------------------------------
+            # ACTIVITY LOG
+            # ------------------------------------------------
+
+            with Vertical(id="activity_panel"):
 
                 yield Static(
-                    "ACTIVITY",
-                    id="log_title",
+                    "ACTIVITY LOG",
+                    id="activity_title",
                 )
 
                 yield RichLog(
-                    id="log",
+                    id="activity",
                     markup=True,
                     highlight=False,
                     wrap=True,
@@ -1383,6 +1592,38 @@ class DLTApp(App):
                 )
 
         yield Footer()
+
+        # ----------------------------------------------------
+        # Explicitly style Textual's internal Select widgets.
+        # This corrects invisible selected text caused by
+        # conflicting theme / SelectCurrent styles.
+        # ----------------------------------------------------
+
+        def ensure_category_visibility() -> None:
+
+            try:
+                picker = self.query_one(
+                    "#category",
+                    Select,
+                )
+
+                picker.styles.color = "#ffffff"
+                picker.styles.background = "#16232e"
+
+                for widget in picker.query("SelectCurrent"):
+
+                    widget.styles.color = "#ffffff"
+                    widget.styles.background = "#16232e"
+                    widget.styles.text_style = "bold"
+
+                    for child in widget.query("*"):
+                        child.styles.color = "#ffffff"
+
+            except Exception:
+                pass
+
+        self.call_later(ensure_category_visibility)
+
 
     # --------------------------------------------------------
     # INITIALIZATION
@@ -1396,18 +1637,18 @@ class DLTApp(App):
         )
 
         columns = [
-            ("NO", "no", 5),
-            ("SECTION", "category", 9),
-            ("DATASET", "topic", 57),
+            ("#", "number", 6),
+            ("SECTION", "category", 10),
+            ("DATASET", "dataset", 55),
             ("PERIOD / OPTION", "period", 22),
-            ("FILE ID", "file_id", 10),
-            ("STATUS", "status", 13),
+            ("FILE ID", "file_id", 12),
+            ("STATUS", "status", 15),
         ]
 
-        for label, key, width in columns:
+        for title, key, width in columns:
 
             table.add_column(
-                label,
+                title,
                 key=key,
                 width=width,
             )
@@ -1417,131 +1658,152 @@ class DLTApp(App):
             Button,
         ).disabled = True
 
-        self.note(
-            "Collector initialized. "
-            "Choose SYNC CATALOG to load the source index."
+        self.write_log(
+            "Application initialized.",
+            "info",
+        )
+
+        self.write_log(
+            "Connecting to DLT catalog...",
+            "info",
+        )
+
+        # Automatically discover the catalog.
+        # No manual button click required.
+        self.call_later(
+            self.action_discover
         )
 
     # --------------------------------------------------------
-    # UI UTILITIES
+    # UI HELPERS
     # --------------------------------------------------------
 
-    def note(
+    def write_log(
         self,
         message: str,
-        kind: str = "info",
+        level: str = "info",
     ) -> None:
 
         colors = {
-            "info": "#aabcc8",
-            "ok": "#71c2b0",
-            "warn": "#d6ba83",
-            "error": "#e7a0a0",
+            "info": "#a9bbc7",
+            "success": "#76c9ad",
+            "warning": "#dec18e",
+            "error": "#ec9f9f",
         }
 
         color = colors.get(
-            kind,
-            "#aabcc8",
+            level,
+            "#a9bbc7",
         )
 
-        hour = datetime.now().strftime(
+        current_time = datetime.now().strftime(
             "%H:%M:%S"
         )
 
         self.query_one(
-            "#log",
+            "#activity",
             RichLog,
         ).write(
-            f"[dim]{hour}[/dim] "
+            f"[dim]{current_time}[/dim]  "
             f"[color={color}]"
             f"{escape(str(message))}"
             f"[/color]"
         )
 
-    def set_operation(
+    def set_status(
         self,
         message: str,
     ) -> None:
 
         self.query_one(
-            "#operation_status",
+            "#status",
             Static,
-        ).update(message)
+        ).update(
+            escape(message)
+        )
 
     def set_busy(
         self,
-        value: bool,
+        busy: bool,
     ) -> None:
 
-        self.busy = value
+        self.busy = busy
 
-        for button in (
-            "sync",
+        for name in (
+            "refresh",
             "download_all",
             "download_selected",
         ):
 
             self.query_one(
-                f"#{button}",
+                f"#{name}",
                 Button,
-            ).disabled = value
+            ).disabled = busy
 
         self.query_one(
             "#category",
             Select,
-        ).disabled = value
+        ).disabled = busy
 
         self.query_one(
             "#stop",
             Button,
-        ).disabled = not value
+        ).disabled = not busy
+
+    def set_progress(
+        self,
+        current: int,
+        total: int,
+    ) -> None:
+
+        self.query_one(
+            "#progress",
+            ProgressBar,
+        ).update(
+            total=max(total, 1),
+            progress=current,
+        )
 
     def update_summary(self) -> None:
 
-        values = {
-            "metric_available": (
-                f"AVAILABLE   {len(self.visible_jobs)}"
-            ),
-            "metric_downloaded": (
-                f"DOWNLOADED   "
-                f"{self.counters['downloaded']}"
-            ),
-            "metric_skipped": (
-                f"SKIPPED   "
-                f"{self.counters['skipped']}"
-            ),
-            "metric_failed": (
-                f"FAILED   "
-                f"{self.counters['failed']}"
-            ),
-        }
+        summary = (
+            f"AVAILABLE   {len(self.visible_jobs):,}"
+            "        "
+            f"DOWNLOADED   {self.counters['downloaded']:,}"
+            "        "
+            f"SKIPPED   {self.counters['skipped']:,}"
+            "        "
+            f"FAILED   {self.counters['failed']:,}"
+        )
 
-        for selector, value in values.items():
-
-            self.query_one(
-                f"#{selector}",
-                Static,
-            ).update(value)
+        self.query_one(
+            "#summary",
+            Static,
+        ).update(summary)
 
     @staticmethod
-    def status_text(status: str) -> Text:
+    def formatted_status(
+        status: str,
+    ) -> Text:
+
+        status = status.upper()
 
         colors = {
-            "READY": "#90a5b4",
-            "RUNNING": "#d9c389",
-            "DOWNLOADED": "#71c2b0",
-            "SKIPPED": "#9daeb8",
-            "ERROR": "#e7a0a0",
-            "SSL_ERROR": "#e7a0a0",
-            "NOT_EXCEL": "#e7a0a0",
-            "STOPPED": "#d9c389",
+            "READY": "#9aafbd",
+            "RUNNING": "#dec18e",
+            "DOWNLOADED": "#76c9ad",
+            "SKIPPED": "#aab8c1",
+            "ERROR": "#ec9f9f",
+            "NOT_EXCEL": "#ec9f9f",
+            "SSL_ERROR": "#ec9f9f",
+            "STOPPED": "#dec18e",
         }
 
         return Text(
             status,
             style=colors.get(
                 status,
-                "#90a5b4",
+                "#9aafbd",
             ),
         )
 
@@ -1549,9 +1811,9 @@ class DLTApp(App):
     # CATALOG TABLE
     # --------------------------------------------------------
 
-    def show_catalog(self) -> None:
+    def refresh_table(self) -> None:
 
-        selected = self.query_one(
+        selected_category = self.query_one(
             "#category",
             Select,
         ).value
@@ -1565,18 +1827,18 @@ class DLTApp(App):
             job
             for job in self.all_jobs
             if (
-                selected == "ALL"
-                or job.category == selected
+                selected_category == "ALL"
+                or job.category == selected_category
             )
             and (
                 not search
                 or search in " ".join(
-                    (
+                    [
                         job.category,
                         job.description,
                         job.period,
                         job.file_id,
-                    )
+                    ]
                 ).casefold()
             )
         ]
@@ -1588,7 +1850,7 @@ class DLTApp(App):
 
         table.clear()
 
-        self.row_by_key.clear()
+        self.row_keys.clear()
         self.selected_job = None
 
         for index, job in enumerate(
@@ -1603,8 +1865,8 @@ class DLTApp(App):
                 job.description,
                 job.period,
                 job.file_id,
-                self.status_text(
-                    self.status_by_key.get(
+                self.formatted_status(
+                    self.job_status.get(
                         job.key,
                         "READY",
                     )
@@ -1612,44 +1874,41 @@ class DLTApp(App):
                 key=row_key,
             )
 
-            self.row_by_key[job.key] = row_key
+            self.row_keys[job.key] = row_key
 
-        if self.all_jobs:
+        if self.visible_jobs:
 
-            catalog_note = (
-                f"{len(self.visible_jobs):,} displayed"
-                "  /  "
-                f"{len(self.all_jobs):,} indexed"
-            )
-
-        else:
-
-            catalog_note = (
-                "Select a row to download individually"
-            )
+            # Select the first available item by default.
+            self.selected_job = self.visible_jobs[0]
 
         self.query_one(
-            "#catalog_note",
+            "#catalog_info",
             Static,
-        ).update(catalog_note)
+        ).update(
+            (
+                f"{len(self.visible_jobs):,} visible"
+                "  /  "
+                f"{len(self.all_jobs):,} total"
+            )
+        )
 
         self.update_summary()
 
-    def set_job_state(
+    def set_job_status(
         self,
-        job: Job,
+        job: DownloadJob,
         status: str,
     ) -> None:
 
         status = status.upper()
 
-        self.status_by_key[job.key] = status
+        self.job_status[job.key] = status
 
-        key = self.row_by_key.get(
+        row_key = self.row_keys.get(
             job.key
         )
 
-        if key is None:
+        if row_key is None:
             return
 
         try:
@@ -1658,9 +1917,9 @@ class DLTApp(App):
                 "#table",
                 DataTable,
             ).update_cell(
-                key,
+                row_key,
                 "status",
-                self.status_text(status),
+                self.formatted_status(status),
             )
 
         except Exception:
@@ -1679,7 +1938,8 @@ class DLTApp(App):
             event.select.id == "category"
             and self.is_mounted
         ):
-            self.show_catalog()
+
+            self.refresh_table()
 
     def on_input_changed(
         self,
@@ -1690,7 +1950,8 @@ class DLTApp(App):
             event.input.id == "search"
             and self.is_mounted
         ):
-            self.show_catalog()
+
+            self.refresh_table()
 
     def on_data_table_row_highlighted(
         self,
@@ -1708,10 +1969,10 @@ class DLTApp(App):
             )
 
         except (
+            IndexError,
+            ValueError,
             AttributeError,
             TypeError,
-            ValueError,
-            IndexError,
         ):
 
             self.selected_job = None
@@ -1721,33 +1982,80 @@ class DLTApp(App):
         event: DataTable.RowSelected,
     ) -> None:
 
-        self.on_data_table_row_highlighted(
-            event
-        )
+        try:
+
+            index = int(
+                str(event.row_key.value)
+            )
+
+            self.selected_job = (
+                self.visible_jobs[index]
+            )
+
+            self.set_status(
+                "SELECTED  /  "
+                f"{self.selected_job.category}  /  "
+                f"{self.selected_job.period}  /  "
+                f"ID {self.selected_job.file_id}"
+            )
+
+        except (
+            IndexError,
+            ValueError,
+            AttributeError,
+            TypeError,
+        ):
+            pass
 
     def on_button_pressed(
         self,
         event: Button.Pressed,
     ) -> None:
 
-        handlers = {
-            "sync": self.action_discover,
-            "download_all": self.action_download_all,
-            "download_selected": (
-                self.action_download_selected
-            ),
-            "stop": self.action_stop,
-        }
+        button_id = event.button.id
 
-        handler = handlers.get(
-            event.button.id
+        if button_id == "refresh":
+
+            self.action_discover()
+
+        elif button_id == "download_all":
+
+            self.action_download_all()
+
+        elif button_id == "download_selected":
+
+            self.action_download_selected()
+
+        elif button_id == "stop":
+
+            self.action_stop()
+
+        elif button_id == "settings_button":
+
+            self.toggle_settings()
+
+    def toggle_settings(self) -> None:
+
+        panel = self.query_one(
+            "#advanced",
+            Vertical,
         )
 
-        if handler:
-            handler()
+        panel.display = not panel.display
+
+        button = self.query_one(
+            "#settings_button",
+            Button,
+        )
+
+        button.label = (
+            "CLOSE OPTIONS"
+            if panel.display
+            else "OPTIONS"
+        )
 
     # --------------------------------------------------------
-    # CATALOG DISCOVERY
+    # DISCOVERY
     # --------------------------------------------------------
 
     def action_discover(self) -> None:
@@ -1755,24 +2063,15 @@ class DLTApp(App):
         if self.busy:
             return
 
-        self.stop_signal.clear()
+        self.stop_event.clear()
+
         self.set_busy(True)
 
-        self.query_one(
-            "#progress",
-            ProgressBar,
-        ).update(
-            total=4,
-            progress=0,
-        )
+        self.set_progress(0, 4)
 
-        self.set_operation(
-            "INDEXING   /   "
-            "Retrieving available files from DLT..."
-        )
-
-        self.note(
-            "Connecting to DLT statistics catalog..."
+        self.set_status(
+            "DISCOVERING  /  "
+            "Reading available files from DLT..."
         )
 
         insecure = self.query_one(
@@ -1792,109 +2091,122 @@ class DLTApp(App):
         insecure: bool,
     ) -> None:
 
-        session = new_session(insecure)
+        session = create_session(insecure)
 
-        jobs = []
-        failures = 0
+        collected = []
+        errors = 0
 
         try:
 
-            for i, category in enumerate(
+            for index, category in enumerate(
                 CATEGORIES,
-                1,
+                start=1,
             ):
 
-                if self.stop_signal.is_set():
+                if self.stop_event.is_set():
                     break
+
+                self.call_from_thread(
+                    self.write_log,
+                    f"Scanning category {category}...",
+                )
 
                 try:
 
-                    entries = fetch_catalog(
+                    jobs = fetch_category(
                         session,
                         category,
                     )
 
-                    jobs.extend(entries)
+                    collected.extend(jobs)
 
                     self.call_from_thread(
-                        self.note,
+                        self.write_log,
                         (
                             f"{category}  /  "
-                            f"{len(entries)} entries indexed"
+                            f"{len(jobs)} files discovered"
                         ),
-                        "ok",
+                        "success",
                     )
 
-                except Exception as exc:
+                except Exception as error:
 
-                    failures += 1
+                    errors += 1
 
                     self.call_from_thread(
-                        self.note,
+                        self.write_log,
                         (
                             f"{category}  /  "
-                            f"{type(exc).__name__}: {exc}"
+                            f"{type(error).__name__}: {error}"
                         ),
                         "error",
                     )
 
                 self.call_from_thread(
-                    self.query_one(
-                        "#progress",
-                        ProgressBar,
-                    ).update,
-                    progress=i,
+                    self.set_progress,
+                    index,
+                    4,
                 )
 
             unique = list(
                 {
                     job.key: job
-                    for job in jobs
+                    for job in collected
                 }.values()
             )
 
             self.call_from_thread(
-                self.discovery_done,
+                self.discovery_finished,
                 unique,
-                failures,
+                errors,
             )
 
         finally:
 
             session.close()
 
-    def discovery_done(
+    def discovery_finished(
         self,
-        jobs: list[Job],
-        failures: int,
+        jobs: list[DownloadJob],
+        errors: int,
     ) -> None:
 
         self.all_jobs = jobs
 
-        self.show_catalog()
+        self.refresh_table()
         self.set_busy(False)
 
-        self.set_operation(
-            f"CATALOG   /   "
+        if self.stop_event.is_set():
+
+            self.set_status(
+                "DISCOVERY STOPPED"
+            )
+
+            return
+
+        self.set_status(
+            f"READY  /  "
             f"{len(jobs):,} files indexed"
-            f" · {failures} category errors"
         )
 
-        if failures:
+        if errors:
 
-            self.note(
-                "Catalog finished with "
-                f"{failures} failed categories.",
-                "warn",
+            self.write_log(
+                (
+                    f"Catalog loaded with "
+                    f"{errors} category errors."
+                ),
+                "warning",
             )
 
         else:
 
-            self.note(
-                "Catalog ready: "
-                f"{len(jobs):,} files "
-                "across 4 categories.",
-                "ok",
+            self.write_log(
+                (
+                    f"Catalog ready. "
+                    f"{len(jobs):,} files available."
+                ),
+                "success",
             )
 
     # --------------------------------------------------------
@@ -1906,7 +2218,7 @@ class DLTApp(App):
         if self.busy:
             return
 
-        self.launch_download(
+        self.start_download(
             list(self.visible_jobs)
         )
 
@@ -1915,31 +2227,29 @@ class DLTApp(App):
         if self.busy:
             return
 
-        if self.selected_job is None:
+        if not self.selected_job:
 
-            self.note(
-                "Highlight a row in "
-                "the file catalog first.",
-                "warn",
+            self.write_log(
+                "Select a file from the catalog first.",
+                "warning",
             )
 
             return
 
-        self.launch_download(
+        self.start_download(
             [self.selected_job]
         )
 
-    def launch_download(
+    def start_download(
         self,
-        jobs: list[Job],
+        jobs: list[DownloadJob],
     ) -> None:
 
         if not jobs:
 
-            self.note(
-                "No files selected. "
-                "Sync the catalog first.",
-                "warn",
+            self.write_log(
+                "No files available for download.",
+                "warning",
             )
 
             return
@@ -1965,23 +2275,22 @@ class DLTApp(App):
 
         except ValueError:
 
-            self.note(
-                "LIMIT must be >= 0 "
-                "and DELAY must be >= 0.",
+            self.write_log(
+                "Invalid limit or delay setting.",
                 "error",
             )
 
             return
 
-        name = self.query_one(
+        output_value = self.query_one(
             "#output",
             Input,
         ).value.strip()
 
-        if not name:
+        if not output_value:
 
-            self.note(
-                "Output path must not be empty.",
+            self.write_log(
+                "Output directory cannot be empty.",
                 "error",
             )
 
@@ -1990,8 +2299,8 @@ class DLTApp(App):
         if limit:
             jobs = jobs[:limit]
 
-        root = Path(
-            name
+        output = Path(
+            output_value
         ).expanduser().resolve()
 
         force = self.query_one(
@@ -2012,38 +2321,30 @@ class DLTApp(App):
 
         self.update_summary()
 
-        self.stop_signal.clear()
+        self.stop_event.clear()
         self.set_busy(True)
 
-        self.query_one(
-            "#progress",
-            ProgressBar,
-        ).update(
-            total=len(jobs),
-            progress=0,
+        self.set_progress(
+            0,
+            len(jobs),
         )
 
-        self.set_operation(
-            f"DOWNLOAD   /   "
-            f"0 of {len(jobs)} processed"
+        self.set_status(
+            f"DOWNLOADING  /  "
+            f"0 of {len(jobs)} files"
         )
 
-        self.note(
-            f"Starting {len(jobs)} files"
-            f" · output: {root}"
+        self.write_log(
+            (
+                f"Starting download "
+                f"of {len(jobs)} files."
+            ),
+            "info",
         )
-
-        if insecure:
-
-            self.note(
-                "SSL certificate verification "
-                "is disabled.",
-                "warn",
-            )
 
         self.download_worker(
             jobs,
-            root,
+            output,
             force,
             insecure,
             delay,
@@ -2060,29 +2361,30 @@ class DLTApp(App):
     )
     def download_worker(
         self,
-        jobs: list[Job],
-        root: Path,
+        jobs: list[DownloadJob],
+        output: Path,
         force: bool,
         insecure: bool,
         delay: float,
     ) -> None:
 
-        session = new_session(insecure)
+        session = create_session(insecure)
 
-        completed = 0
+        processed = 0
 
         try:
 
-            root.mkdir(
+            output.mkdir(
                 parents=True,
                 exist_ok=True,
             )
 
             manifest = (
-                root / "manifest.csv"
+                output
+                / "manifest.csv"
             )
 
-            needs_header = (
+            write_header = (
                 not manifest.exists()
                 or manifest.stat().st_size == 0
             )
@@ -2091,60 +2393,59 @@ class DLTApp(App):
                 "a",
                 newline="",
                 encoding="utf-8-sig",
-            ) as output:
+            ) as file:
 
                 writer = csv.DictWriter(
-                    output,
-                    fieldnames=MANIFEST_FIELDS,
+                    file,
+                    fieldnames=MANIFEST_COLUMNS,
                 )
 
-                if needs_header:
+                if write_header:
 
                     writer.writeheader()
-                    output.flush()
+                    file.flush()
 
-                for number, job in enumerate(
+                for index, job in enumerate(
                     jobs,
-                    1,
+                    start=1,
                 ):
 
-                    if self.stop_signal.is_set():
+                    if self.stop_event.is_set():
                         break
 
                     self.call_from_thread(
-                        self.set_operation,
+                        self.set_status,
                         (
-                            f"DOWNLOAD   /   "
-                            f"{number} of {len(jobs)}"
-                            f" · Section {job.category}"
-                            f" · File {job.file_id}"
+                            f"DOWNLOADING  /  "
+                            f"{index} of {len(jobs)}"
+                            f"  /  File {job.file_id}"
                         ),
                     )
 
                     self.call_from_thread(
-                        self.set_job_state,
+                        self.set_job_status,
                         job,
                         "RUNNING",
                     )
 
-                    result = download_job(
+                    result = download_file(
                         session,
                         job,
-                        root,
-                        self.stop_signal,
+                        output,
+                        self.stop_event,
                         force,
                     )
 
                     writer.writerow(result)
-                    output.flush()
+                    file.flush()
 
-                    completed += 1
+                    processed += 1
 
                     self.call_from_thread(
-                        self.download_result,
+                        self.handle_result,
                         job,
                         result,
-                        completed,
+                        processed,
                         len(jobs),
                     )
 
@@ -2155,16 +2456,19 @@ class DLTApp(App):
                         break
 
                     if (
-                        number < len(jobs)
-                        and self.stop_signal.wait(delay)
+                        index < len(jobs)
+                        and self.stop_event.wait(delay)
                     ):
                         break
 
-        except Exception as exc:
+        except Exception as error:
 
             self.call_from_thread(
-                self.note,
-                f"Download session error: {exc}",
+                self.write_log,
+                (
+                    f"Download session error: "
+                    f"{type(error).__name__}: {error}"
+                ),
                 "error",
             )
 
@@ -2173,26 +2477,26 @@ class DLTApp(App):
             session.close()
 
             self.call_from_thread(
-                self.download_done,
-                completed,
+                self.download_finished,
+                processed,
                 len(jobs),
             )
 
     # --------------------------------------------------------
-    # LIVE DOWNLOAD RESULTS
+    # LIVE RESULTS
     # --------------------------------------------------------
 
-    def download_result(
+    def handle_result(
         self,
-        job: Job,
+        job: DownloadJob,
         result: dict,
-        completed: int,
+        processed: int,
         total: int,
     ) -> None:
 
         status = result["status"]
 
-        self.set_job_state(
+        self.set_job_status(
             job,
             status,
         )
@@ -2201,77 +2505,84 @@ class DLTApp(App):
 
             self.counters["downloaded"] += 1
 
-            self.note(
-                f"{completed}/{total}"
-                f"  SAVED  {job.file_id}"
-                f" · {result['file_size']:,} bytes",
-                "ok",
+            self.write_log(
+                (
+                    f"{processed}/{total}  "
+                    f"Saved file {job.file_id}  "
+                    f"({result['file_size']:,} bytes)"
+                ),
+                "success",
             )
 
         elif status == "skipped":
 
             self.counters["skipped"] += 1
 
-            self.note(
-                f"{completed}/{total}"
-                f"  SKIPPED  {job.file_id}"
-                " · already downloaded"
+            self.write_log(
+                (
+                    f"{processed}/{total}  "
+                    f"Skipped file {job.file_id}"
+                ),
+                "info",
             )
 
         elif status == "stopped":
 
-            self.note(
-                "Download stopped by user.",
-                "warn",
+            self.write_log(
+                "Download stopped.",
+                "warning",
             )
 
         else:
 
             self.counters["failed"] += 1
 
-            self.note(
-                f"{completed}/{total}"
-                f"  {status.upper()}"
-                f"  {job.file_id}"
-                f" · {result['error']}",
+            self.write_log(
+                (
+                    f"{processed}/{total}  "
+                    f"Failed file {job.file_id}: "
+                    f"{result['error']}"
+                ),
                 "error",
             )
 
-        self.query_one(
-            "#progress",
-            ProgressBar,
-        ).update(
-            progress=completed
+        self.set_progress(
+            processed,
+            total,
         )
 
         self.update_summary()
 
-    def download_done(
+    def download_finished(
         self,
-        completed: int,
+        processed: int,
         total: int,
     ) -> None:
 
         self.set_busy(False)
 
-        status = (
+        state = (
             "STOPPED"
-            if self.stop_signal.is_set()
+            if self.stop_event.is_set()
             else "COMPLETE"
         )
 
-        self.set_operation(
-            f"{status}   /   "
-            f"{completed} of {total}"
-            f" · {self.counters['downloaded']} saved"
-            f" · {self.counters['skipped']} skipped"
-            f" · {self.counters['failed']} failed"
+        self.set_status(
+            (
+                f"{state}  /  "
+                f"{processed} of {total} files  /  "
+                f"{self.counters['downloaded']} saved  /  "
+                f"{self.counters['skipped']} skipped  /  "
+                f"{self.counters['failed']} failed"
+            )
         )
 
-        self.note(
-            "Session finished: "
-            f"{completed}/{total} entries processed.",
-            "ok",
+        self.write_log(
+            (
+                f"Session finished: "
+                f"{processed}/{total} files processed."
+            ),
+            "success",
         )
 
     # --------------------------------------------------------
@@ -2283,22 +2594,28 @@ class DLTApp(App):
         if not self.busy:
             return
 
-        self.stop_signal.set()
+        self.stop_event.set()
 
-        self.set_operation(
-            "STOP REQUESTED   /   "
+        self.set_status(
+            "STOP REQUESTED  /  "
             "Finishing current request..."
         )
 
-        self.note(
+        self.write_log(
             "Stop requested.",
-            "warn",
+            "warning",
         )
 
 
 # ============================================================
-# ENTRY POINT
+# MAIN
 # ============================================================
 
+def main() -> None:
+
+    app = DLTApp()
+    app.run()
+
+
 if __name__ == "__main__":
-    DLTApp().run()
+    main()
